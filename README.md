@@ -178,6 +178,10 @@ The `Options` type provides the hooks and customizations offered by gocrawl. All
 
 *    **URLNormalizationFlags** : The flags to apply when normalizing the URL using the [purell][] library. The URLs are normalized before being enqueued and passed around to the `Extender` methods in the `URLContext` structure. Defaults to the most aggressive normalization allowed by purell, `purell.FlagsAllGreedy`.
 
+*    **MaxBodyBytes** : The maximum number of body bytes accepted from a `Fetch` response (for the default HTTP fetcher, this is the decompressed size). It applies to both page and robots.txt bodies. A larger body results in a single `CrawlError` of kind `CekBodyTooLarge`: the page is not visited (`Visit` and `Visited` are not called, no links are extracted and the visit is not counted), and a robots.txt failure disallows all pages of that host (other hosts are unaffected). Defaults to zero, no limit.
+
+*    **MaxBodyMemBytes** : The maximum number of body bytes held in memory to replay the body to the parser and to the `Visit` and `FetchedRobots` hooks (parser and extender allocations are not counted). Bodies larger than this - but within `MaxBodyBytes` - are spilled to a temporary file and streamed back from there, they are never read back into memory in full. The temporary file is removed on all paths. Defaults to zero, no limit. When both budgets are set, `MaxBodyMemBytes` should be lower than or equal to `MaxBodyBytes`; a greater value is clamped to `MaxBodyBytes`.
+
 *    **LogFlags** : The level of verbosity for logging. Defaults to errors only (`LogError`). Can be a set of flags (i.e. `LogError | LogTrace`).
 
 *    **Extender** : The instance implementing the `Extender` interface. This implements the various callbacks offered by gocrawl. Must be specified when creating a `Crawler` (or when creating an `Options` to pass to `NewCrawlerWithOptions` constructor). A default extender is provided as a valid default implementation, `DefaultExtender`. It can be used by [embedding it as an anonymous field][gotalk] to implement a custom extender when not all methods need customization (see the example above).

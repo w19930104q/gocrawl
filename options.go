@@ -70,6 +70,27 @@ type Options struct {
 	// See the purell package for details.
 	URLNormalizationFlags purell.NormalizationFlags
 
+	// MaxBodyBytes is the maximum number of body bytes accepted from a
+	// Fetch response (for the default HTTP fetcher, this is the
+	// decompressed size). It applies to both page and robots.txt bodies.
+	// A larger body results in a single CrawlError of kind CekBodyTooLarge:
+	// the page is not visited (Visit and Visited are not called, no links
+	// are extracted and the visit is not counted), and a robots.txt
+	// failure disallows all pages of that host. A value of 0 (the
+	// default) means no limit.
+	MaxBodyBytes int64
+
+	// MaxBodyMemBytes is the maximum number of body bytes held in memory
+	// to replay the body to the parser and to the Visit and FetchedRobots
+	// hooks (parser and extender allocations are not counted). Bodies
+	// larger than this - but within MaxBodyBytes - are spilled to a
+	// temporary file and streamed back from there, they are never read
+	// back into memory in full. A value of 0 (the default) means no
+	// limit. When both budgets are set, MaxBodyMemBytes should be lower
+	// than or equal to MaxBodyBytes; a greater value is clamped to
+	// MaxBodyBytes.
+	MaxBodyMemBytes int64
+
 	// LogFlags controls the verbosity of the logger.
 	LogFlags LogFlags
 
@@ -94,6 +115,8 @@ func NewOptions(ext Extender) *Options {
 		true,
 		false,
 		DefaultNormalizationFlags,
+		0,
+		0,
 		LogError,
 		ext,
 	}

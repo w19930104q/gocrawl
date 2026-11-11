@@ -2,6 +2,7 @@ package gocrawl
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -34,6 +35,9 @@ type worker struct {
 
 	// Robots validation
 	robotsGroup *robotstxt.Group
+	// Set when the robots.txt body failed the body budget (too large, or
+	// read/spill failure): no page of this host may be visited.
+	robotsDenied bool
 
 	// Logging
 	logFunc func(LogFlags, string, ...interface{})
@@ -106,6 +110,12 @@ func (w *worker) run() {
 
 // Checks if the given URL can be fetched based on robots.txt policies.
 func (w *worker) isAllowedPerRobotsPolicies(u *url.URL) bool {
+	if w.robotsDenied {
+		// The robots.txt body failed the body budget, no page of this
+		// host is allowed.
+		w.logFunc(LogIgnored, "ignored on robots.txt body budget failure: %s", u.String())
+		return false
+	}
 	if w.robotsGroup != nil {
 		// Is this URL allowed per robots.txt policy?
 		ok := w.robotsGroup.Test(u.Path)
@@ -131,8 +141,7 @@ func (w *worker) requestURL(ctx *URLContext, headRequest bool) {
 		// Any 2xx status code is good to go
 		if res.StatusCode >= 200 && res.StatusCode < 300 {
 			// Success, visit the URL
-			harvested = w.visitURL(ctx, res)
-			visited = true
+			harvested, visited = w.visitURL(ctx, res)
 		} else {
 			// Error based on status code received
 			w.opts.Extender.Error(newCrawlErrorMessage(ctx, res.Status, CekHttpStatusCode))
@@ -162,14 +171,49 @@ func (w *worker) getRobotsTxtGroup(ctx *URLContext, b []byte, res *http.Response
 	var e error
 
 	if res != nil {
-		var buf bytes.Buffer
-		io.Copy(&buf, res.Body)
-		res.Body = ioutil.NopCloser(bytes.NewReader(buf.Bytes()))
-		data, e = robotstxt.FromResponse(res)
-		// Rewind the res.Body (by re-creating it from the bytes)
-		res.Body = ioutil.NopCloser(bytes.NewReader(buf.Bytes()))
-		// Error or not, the robots.txt has been fetched, so notify
-		w.opts.Extender.FetchedRobots(ctx, res)
+		if memLimit, maxBytes, on := w.bodyBudget(); on {
+			// Body budget enabled: read the robots.txt body within the
+			// budget, possibly spilling to a temporary file.
+			bb, be := readBodyWithBudget(res.Body, memLimit, maxBytes)
+			// The original body is fully consumed or abandoned, close it.
+			res.Body.Close()
+			if be != nil {
+				w.notifyBodyBudgetError(ctx, be, "robots.txt")
+				// Do not allow this host's pages on a robots.txt body
+				// budget failure.
+				w.robotsDenied = true
+				return nil
+			}
+			defer bb.close()
+
+			var rc io.ReadCloser
+			if rc, be = bb.reader(); be != nil {
+				w.notifyBodyBudgetError(ctx, be, "robots.txt")
+				w.robotsDenied = true
+				return nil
+			}
+			res.Body = rc
+			data, e = robotstxt.FromResponse(res)
+			// Rewind the body so that FetchedRobots gets the complete
+			// robots.txt content.
+			if rc, be = bb.reader(); be != nil {
+				w.notifyBodyBudgetError(ctx, be, "robots.txt")
+				w.robotsDenied = true
+				return nil
+			}
+			res.Body = rc
+			// The robots.txt has been fetched, so notify
+			w.opts.Extender.FetchedRobots(ctx, res)
+		} else {
+			var buf bytes.Buffer
+			io.Copy(&buf, res.Body)
+			res.Body = ioutil.NopCloser(bytes.NewReader(buf.Bytes()))
+			data, e = robotstxt.FromResponse(res)
+			// Rewind the res.Body (by re-creating it from the bytes)
+			res.Body = ioutil.NopCloser(bytes.NewReader(buf.Bytes()))
+			// Error or not, the robots.txt has been fetched, so notify
+			w.opts.Extender.FetchedRobots(ctx, res)
+		}
 	} else {
 		data, e = robotstxt.FromBytes(b)
 	}
@@ -322,27 +366,105 @@ func (w *worker) sendResponse(ctx *URLContext, visited bool, harvested interface
 	}
 }
 
-// Process the response for a URL.
-func (w *worker) visitURL(ctx *URLContext, res *http.Response) interface{} {
+// bodyBudget returns the configured body budget: the in-memory replay limit
+// and the total body limit, and whether the budget is enabled (both limits
+// are 0 - the default - means the budget feature is off).
+func (w *worker) bodyBudget() (memLimit int64, maxBytes int64, on bool) {
+	memLimit, maxBytes = w.opts.MaxBodyMemBytes, w.opts.MaxBodyBytes
+	if memLimit <= 0 && maxBytes <= 0 {
+		return 0, 0, false
+	}
+	if memLimit > maxBytes && maxBytes > 0 {
+		// The memory budget cannot exceed the total body budget.
+		memLimit = maxBytes
+	}
+	return memLimit, maxBytes, true
+}
+
+// Notify a body budget failure (too large, or read/spill failure) with a
+// single, recognizable error.
+func (w *worker) notifyBodyBudgetError(ctx *URLContext, e error, what string) {
+	kind := CekReadBody
+	if errors.Is(e, ErrBodyTooLarge) {
+		kind = CekBodyTooLarge
+	}
+	w.opts.Extender.Error(newCrawlError(ctx, e, kind))
+	w.logFunc(LogError, "ERROR reading %s body %s: %s", what, ctx.url, e)
+}
+
+// Process the response for a URL. It returns the harvested data and whether
+// the URL was actually visited (a body budget failure prevents the visit).
+func (w *worker) visitURL(ctx *URLContext, res *http.Response) (interface{}, bool) {
 	var doc *goquery.Document
-	var harvested interface{}
-	var doLinks bool
+
+	if memLimit, maxBytes, on := w.bodyBudget(); on {
+		// Body budget enabled: read the body within the budget, possibly
+		// spilling to a temporary file.
+		bb, e := readBodyWithBudget(res.Body, memLimit, maxBytes)
+		// The original body is fully consumed or abandoned, close it.
+		res.Body.Close()
+		if e != nil {
+			w.notifyBodyBudgetError(ctx, e, "page")
+			return nil, false
+		}
+		// The temporary file (if any) is cleaned up when this function
+		// returns, even if a callback panics.
+		defer bb.close()
+
+		// Get the reader to parse the body. A failure here (e.g. a seek
+		// error on the temporary file) is a read failure.
+		var pr, rr io.ReadCloser
+		if pr, e = bb.reader(); e != nil {
+			w.notifyBodyBudgetError(ctx, e, "page")
+			return nil, false
+		}
+
+		// Parse the document (streams from the temporary file when spilled,
+		// the body is never read back into memory in full).
+		doc = w.parseHTML(ctx, pr, res)
+
+		// Rewind the body so it can be consumed by the visitor function.
+		if rr, e = bb.reader(); e != nil {
+			w.notifyBodyBudgetError(ctx, e, "page")
+			return nil, false
+		}
+		res.Body = rr
+
+		return w.visitParsed(ctx, res, doc), true
+	}
 
 	// Load a goquery document and call the visitor function
 	if bd, e := ioutil.ReadAll(res.Body); e != nil {
 		w.opts.Extender.Error(newCrawlError(ctx, e, CekReadBody))
 		w.logFunc(LogError, "ERROR reading body %s: %s", ctx.url, e)
 	} else {
-		if node, e := html.Parse(bytes.NewBuffer(bd)); e != nil {
-			w.opts.Extender.Error(newCrawlError(ctx, e, CekParseBody))
-			w.logFunc(LogError, "ERROR parsing %s: %s", ctx.url, e)
-		} else {
-			doc = goquery.NewDocumentFromNode(node)
-			doc.Url = res.Request.URL
-		}
+		doc = w.parseHTML(ctx, bytes.NewBuffer(bd), res)
 		// Re-assign the body so it can be consumed by the visitor function
 		res.Body = ioutil.NopCloser(bytes.NewBuffer(bd))
 	}
+
+	return w.visitParsed(ctx, res, doc), true
+}
+
+// Parse the HTML document from the given reader. It returns nil (and
+// notifies the error) if the document cannot be parsed.
+func (w *worker) parseHTML(ctx *URLContext, r io.Reader, res *http.Response) *goquery.Document {
+	node, e := html.Parse(r)
+	if e != nil {
+		w.opts.Extender.Error(newCrawlError(ctx, e, CekParseBody))
+		w.logFunc(LogError, "ERROR parsing %s: %s", ctx.url, e)
+		return nil
+	}
+	doc := goquery.NewDocumentFromNode(node)
+	doc.Url = res.Request.URL
+	return doc
+}
+
+// Visit the document (with nil goquery doc if it failed to load), process
+// its links if requested, and notify that this URL has been visited.
+func (w *worker) visitParsed(ctx *URLContext, res *http.Response, doc *goquery.Document) interface{} {
+	var harvested interface{}
+	var doLinks bool
 
 	// Visit the document (with nil goquery doc if failed to load)
 	if harvested, doLinks = w.opts.Extender.Visit(ctx, res, doc); doLinks {

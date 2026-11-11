@@ -17,6 +17,11 @@ var (
 	// ErrInterrupted is returned when the crawler is manually stopped
 	// (via a call to Stop).
 	ErrInterrupted = errors.New("interrupted")
+
+	// ErrBodyTooLarge is returned (as a CrawlError of kind CekBodyTooLarge,
+	// possibly wrapped) when a fetched body exceeds the limit set by the
+	// Options.MaxBodyBytes field.
+	ErrBodyTooLarge = errors.New("body exceeds the maximum allowed size")
 )
 
 // CrawlErrorKind indicated the kind of crawling error.
@@ -32,6 +37,7 @@ const (
 	CekParseURL
 	CekProcessLinks
 	CekParseRedirectURL
+	CekBodyTooLarge
 )
 
 var (
@@ -44,6 +50,7 @@ var (
 		CekParseURL:         "ParseURL",
 		CekProcessLinks:     "ProcessLinks",
 		CekParseRedirectURL: "ParseRedirectURL",
+		CekBodyTooLarge:     "BodyTooLarge",
 	}
 )
 
