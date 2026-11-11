@@ -172,6 +172,10 @@ The `Options` type provides the hooks and customizations offered by gocrawl. All
 
 *    **WorkerIdleTTL** : The idle time-to-live allowed for a worker before it is cleared (its goroutine terminated). Defaults to 10 seconds. The crawl delay is not part of idle time, this is specifically the time when the worker is available, but there are no URLs to process.
 
+*    **MaxReplayBuffer** : The maximum number of fetched body bytes kept in memory for replay to the HTML parser and to the `Visit`/`FetchedRobots` hooks. When a body is bigger, it is written to a temporary file and replayed from there, so it is never read back entirely in memory. Parser and extender allocations are not counted against this limit. This is the `M` of the body budget (`0 < M <= MaxBodyBytes`). Defaults to zero, which disables the body budget and preserves the historical behaviour (the whole body is read in memory).
+
+*    **MaxBodyBytes** : The maximum size of a fetched response body (`L` of the body budget). It applies to both page bodies and downloaded robots.txt bodies. With the default HTTP client, this is the decompressed size. When a page body exceeds this limit, or its body cannot be read/stored, exactly one `Error` hook is reported and the page is not visited: `Visit`/`Visited` are not called, links are not harvested, and the page is not counted as a successful visit. When a robots.txt body fails the same way, the host fails closed (its pages are disallowed and `FetchedRobots` is not called, leaving any cached robots data unchanged), while other hosts continue. Defaults to zero, which disables the body budget.
+
 *    **SameHostOnly** : Limit the URLs to enqueue only to those links targeting the same host, which is `true` by default.
 
 *    **HeadBeforeGet** : Asks the crawler to issue a HEAD request (and a subsequent `RequestGet()` extender method call) before making the eventual GET request. This is set to `false` by default. See also the `URLContext` structure explained below.

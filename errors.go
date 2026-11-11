@@ -17,6 +17,14 @@ var (
 	// ErrInterrupted is returned when the crawler is manually stopped
 	// (via a call to Stop).
 	ErrInterrupted = errors.New("interrupted")
+
+	// ErrBodyTooLarge is reported when a fetched body is bigger than the
+	// configured MaxBodyBytes limit.
+	ErrBodyTooLarge = errors.New("crawl body exceeds the maximum allowed size")
+
+	// ErrBodySpill is reported when a body cannot be written to a
+	// temporary file after it exceeded the replay buffer size.
+	ErrBodySpill = errors.New("crawl body cannot be stored in a temporary file")
 )
 
 // CrawlErrorKind indicated the kind of crawling error.
@@ -32,6 +40,8 @@ const (
 	CekParseURL
 	CekProcessLinks
 	CekParseRedirectURL
+	CekBodyTooLarge
+	CekBodySpill
 )
 
 var (
@@ -44,6 +54,8 @@ var (
 		CekParseURL:         "ParseURL",
 		CekProcessLinks:     "ProcessLinks",
 		CekParseRedirectURL: "ParseRedirectURL",
+		CekBodyTooLarge:     "BodyTooLarge",
+		CekBodySpill:        "BodySpill",
 	}
 )
 

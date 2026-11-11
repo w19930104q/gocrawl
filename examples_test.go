@@ -32,7 +32,7 @@ func (x *ExampleExtender) Filter(ctx *gocrawl.URLContext, isVisited bool) bool {
 	return !isVisited && rxOk.MatchString(ctx.NormalizedURL().String())
 }
 
-func ExampleCrawl() {
+func Example() {
 	// Set custom options
 	opts := gocrawl.NewOptions(new(ExampleExtender))
 

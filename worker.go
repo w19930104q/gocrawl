@@ -2,6 +2,7 @@ package gocrawl
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -125,14 +126,16 @@ func (w *worker) requestURL(ctx *URLContext, headRequest bool) {
 		var harvested interface{}
 		var visited bool
 
-		// Close the body on function end
+		// Close the body on function end. This is the body returned by
+		// Fetch; when the budget is enabled, the worker may replace
+		// res.Body with a replay reader for the hooks, but the original
+		// body still gets closed here.
 		defer res.Body.Close()
 
 		// Any 2xx status code is good to go
 		if res.StatusCode >= 200 && res.StatusCode < 300 {
 			// Success, visit the URL
-			harvested = w.visitURL(ctx, res)
-			visited = true
+			harvested, visited = w.visitURL(ctx, res)
 		} else {
 			// Error based on status code received
 			w.opts.Extender.Error(newCrawlErrorMessage(ctx, res.Status, CekHttpStatusCode))
@@ -152,11 +155,18 @@ func (w *worker) requestRobotsTxt(ctx *URLContext) {
 	} else if res, ok := w.fetchURL(ctx, w.opts.UserAgent, false); ok {
 		// Close the body on function end
 		defer res.Body.Close()
-		w.robotsGroup = w.getRobotsTxtGroup(ctx, nil, res)
+
+		if maxReplayBuffer, maxBodyBytes, enabled := bodyBudget(w.opts); enabled {
+			w.robotsGroup = w.getRobotsTxtGroupBudgeted(ctx, res, maxReplayBuffer, maxBodyBytes)
+		} else {
+			w.robotsGroup = w.getRobotsTxtGroup(ctx, nil, res)
+		}
 	}
 }
 
-// Get the robots.txt group for this crawler.
+// Get the robots.txt group for this crawler, without a body budget. This is
+// the historical implementation: the whole body is read in memory and the
+// FetchedRobots hook receives a complete, rewound body.
 func (w *worker) getRobotsTxtGroup(ctx *URLContext, b []byte, res *http.Response) (g *robotstxt.Group) {
 	var data *robotstxt.RobotsData
 	var e error
@@ -184,6 +194,68 @@ func (w *worker) getRobotsTxtGroup(ctx *URLContext, b []byte, res *http.Response
 		g = data.FindGroup(w.opts.RobotUserAgent)
 	}
 	return g
+}
+
+// getRobotsTxtGroupBudgeted reads the robots.txt body under the configured
+// body budget. On a size/read/spill error it fails closed for this host: a
+// deny-all group is returned and FetchedRobots is not called, so any cached
+// robots data is left untouched. Other hosts use their own worker and are
+// not affected.
+func (w *worker) getRobotsTxtGroupBudgeted(ctx *URLContext, res *http.Response, maxReplayBuffer, maxBodyBytes int) *robotstxt.Group {
+	body, err := collectBudgetBody(res.Body, maxReplayBuffer, maxBodyBytes)
+	if err != nil {
+		w.reportBodyError(ctx, err, true)
+		return denyAllRobotsGroup()
+	}
+	defer body.Close()
+
+	// Parse the robots.txt from a complete reader.
+	parseReader, err := body.newReader()
+	if err != nil {
+		w.reportBodyError(ctx, err, true)
+		return denyAllRobotsGroup()
+	}
+	oldBody := res.Body
+	res.Body = parseReader
+	data, parseErr := func() (*robotstxt.RobotsData, error) {
+		defer parseReader.Close()
+		return robotstxt.FromResponse(res)
+	}()
+	res.Body = oldBody
+
+	// The hook receives the complete body, rewound to its start.
+	hookReader, err := body.newReader()
+	if err != nil {
+		w.reportBodyError(ctx, err, true)
+		return denyAllRobotsGroup()
+	}
+	defer hookReader.Close()
+	res.Body = hookReader
+	w.opts.Extender.FetchedRobots(ctx, res)
+
+	// If robots data cannot be parsed, return nil, which allows access by
+	// default. This matches the historical behaviour; only body-budget
+	// failures fail closed.
+	if parseErr != nil {
+		w.opts.Extender.Error(newCrawlError(nil, parseErr, CekParseRobots))
+		w.logFunc(LogError, "ERROR parsing robots.txt for host %s: %s", w.host, parseErr)
+		return nil
+	}
+	return data.FindGroup(w.opts.RobotUserAgent)
+}
+
+var robotsDenyAllData = func() *robotstxt.RobotsData {
+	data, err := robotstxt.FromBytes([]byte("User-agent: *\nDisallow: /\n"))
+	if err != nil {
+		panic(err)
+	}
+	return data
+}()
+
+// denyAllRobotsGroup returns a group that disallows every path. It is used
+// when the robots.txt body cannot be retrieved or stored within the budget.
+func denyAllRobotsGroup() *robotstxt.Group {
+	return robotsDenyAllData.FindGroup("*")
 }
 
 // Set the crawl delay between this request and the next.
@@ -322,8 +394,97 @@ func (w *worker) sendResponse(ctx *URLContext, visited bool, harvested interface
 	}
 }
 
-// Process the response for a URL.
-func (w *worker) visitURL(ctx *URLContext, res *http.Response) interface{} {
+// Report a body budget failure exactly once through the Error hook. The
+// kind identifies whether the body was too large, could not be stored, or
+// could not be read.
+func (w *worker) reportBodyError(ctx *URLContext, err error, robots bool) {
+	kind := CekReadBody
+	switch {
+	case errors.Is(err, ErrBodyTooLarge):
+		kind = CekBodyTooLarge
+	case errors.Is(err, ErrBodySpill):
+		kind = CekBodySpill
+	}
+	w.opts.Extender.Error(newCrawlError(ctx, err, kind))
+	if robots {
+		w.logFunc(LogError, "ERROR reading robots.txt body for host %s: %s", w.host, err)
+	} else {
+		w.logFunc(LogError, "ERROR reading body %s: %s", ctx.url, err)
+	}
+}
+
+// Process the response for a URL and return the harvested value and whether
+// the URL was successfully visited.
+func (w *worker) visitURL(ctx *URLContext, res *http.Response) (interface{}, bool) {
+	maxReplayBuffer, maxBodyBytes, enabled := bodyBudget(w.opts)
+	if !enabled {
+		return w.visitURLUnbounded(ctx, res), true
+	}
+
+	body, err := collectBudgetBody(res.Body, maxReplayBuffer, maxBodyBytes)
+	if err != nil {
+		// Once the body cannot be read/stored within the budget, the page
+		// is not visited: no Visit/Visited hook, no link harvesting, and
+		// the crawler must not count it as a successful visit.
+		w.reportBodyError(ctx, err, false)
+		return nil, false
+	}
+	defer body.Close()
+
+	var doc *goquery.Document
+
+	// Parse the document from a complete reader. The reader is separate
+	// from the one handed to the hooks, so each consumer starts at byte 0
+	// even when the body is backed by a temporary file.
+	parseReader, err := body.newReader()
+	if err != nil {
+		w.reportBodyError(ctx, err, false)
+		return nil, false
+	}
+	node, parseErr := func() (*html.Node, error) {
+		defer parseReader.Close()
+		return html.Parse(parseReader)
+	}()
+	if parseErr != nil {
+		w.opts.Extender.Error(newCrawlError(ctx, parseErr, CekParseBody))
+		w.logFunc(LogError, "ERROR parsing %s: %s", ctx.url, parseErr)
+	} else {
+		doc = goquery.NewDocumentFromNode(node)
+		doc.Url = res.Request.URL
+	}
+
+	// The visitor receives the complete body, rewound to its start, even
+	// when it was spilled to a temporary file.
+	hookReader, err := body.newReader()
+	if err != nil {
+		w.reportBodyError(ctx, err, false)
+		return nil, false
+	}
+	defer hookReader.Close()
+	res.Body = hookReader
+
+	var harvested interface{}
+	var doLinks bool
+
+	// Visit the document (with nil goquery doc if failed to load)
+	if harvested, doLinks = w.opts.Extender.Visit(ctx, res, doc); doLinks {
+		// Links were not processed by the visitor, so process links
+		if doc != nil {
+			harvested = w.processLinks(doc)
+		} else {
+			w.opts.Extender.Error(newCrawlErrorMessage(ctx, "No goquery document to process links.", CekProcessLinks))
+			w.logFunc(LogError, "ERROR processing links %s", ctx.url)
+		}
+	}
+	// Notify that this URL has been visited
+	w.opts.Extender.Visited(ctx, harvested)
+
+	return harvested, true
+}
+
+// visitURLUnbounded is the historical, unbudgeted implementation. It reads
+// the whole body in memory and always lets the Visit/Visited hooks run.
+func (w *worker) visitURLUnbounded(ctx *URLContext, res *http.Response) interface{} {
 	var doc *goquery.Document
 	var harvested interface{}
 	var doLinks bool

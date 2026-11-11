@@ -56,6 +56,34 @@ type Options struct {
 	// when the worker is available, but there are no URLs to process.
 	WorkerIdleTTL time.Duration
 
+	// MaxReplayBuffer is the maximum number of body bytes kept in memory
+	// for replay to the parser and to the extension hooks (M in the body
+	// budget, with 0 < M <= MaxBodyBytes). Bodies bigger than this are
+	// written to a temporary file instead of being read back in memory.
+	// Parser and extender allocations are not counted against this limit.
+	//
+	// A zero value (the default) disables the body budget entirely, which
+	// preserves the historical behaviour of reading the whole body in
+	// memory.
+	MaxReplayBuffer int
+
+	// MaxReplayBufferBytes is an alternative spelling of MaxReplayBuffer.
+	// If both are set, MaxReplayBuffer takes precedence.
+	MaxReplayBufferBytes int
+
+	// MaxBodyBytes is the maximum size of a fetched response body (L in
+	// the body budget, with 0 < M <= L). It applies to page bodies and to
+	// downloaded robots.txt bodies. With the default HTTP client, the
+	// limit applies to the decompressed size (i.e. the bytes returned by
+	// the transport).
+	//
+	// A zero value (the default) disables the body budget entirely.
+	MaxBodyBytes int
+
+	// MaxBodySize is an alternative spelling of MaxBodyBytes. If both are
+	// set, MaxBodyBytes takes precedence.
+	MaxBodySize int
+
 	// SameHostOnly limits the URLs to enqueue only to those targeting
 	// the same hosts as the ones from the seed URLs.
 	SameHostOnly bool
@@ -84,17 +112,17 @@ type Options struct {
 func NewOptions(ext Extender) *Options {
 	// Use defaults except for Extender
 	return &Options{
-		DefaultUserAgent,
-		DefaultRobotUserAgent,
-		0,
-		DefaultEnqueueChanBuffer,
-		DefaultHostBufferFactor,
-		DefaultCrawlDelay,
-		DefaultIdleTTL,
-		true,
-		false,
-		DefaultNormalizationFlags,
-		LogError,
-		ext,
+		UserAgent:             DefaultUserAgent,
+		RobotUserAgent:        DefaultRobotUserAgent,
+		MaxVisits:             0,
+		EnqueueChanBuffer:     DefaultEnqueueChanBuffer,
+		HostBufferFactor:      DefaultHostBufferFactor,
+		CrawlDelay:            DefaultCrawlDelay,
+		WorkerIdleTTL:         DefaultIdleTTL,
+		SameHostOnly:          true,
+		HeadBeforeGet:         false,
+		URLNormalizationFlags: DefaultNormalizationFlags,
+		LogFlags:              LogError,
+		Extender:              ext,
 	}
 }
